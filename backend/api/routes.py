@@ -5,6 +5,7 @@ from models import Provider, UploadHistory, ValidationResult, ValidationSession
 import pandas as pd
 import json
 import sys
+import re
 import os
 from datetime import datetime
 from typing import List
@@ -14,18 +15,15 @@ import io
 from pydantic import BaseModel
 import asyncio
 
-# Add parent directory to path to import validation_agent
-# Go up two levels: backend/api -> backend -> validation_agent root
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 from vallidation_agent import validate_hospital_doctors, group_doctors_by_hospital, validate_and_write_incremental
 
 router = APIRouter(prefix="/api", tags=["validation"])
 
-# Pydantic models for request bodies
+
 class StartValidationRequest(BaseModel):
     upload_id: int
 
-# Thread-safe storage for validation sessions
 _validation_sessions = {}
 _sessions_lock = threading.Lock()
 
@@ -36,23 +34,22 @@ async def upload_csv(file: UploadFile = File(...), db: Session = Depends(get_db)
         raise HTTPException(status_code=400, detail="Only CSV files allowed")
     
     try:
-        # Read CSV contents
+       
         contents = await file.read()
         df = pd.read_csv(io.BytesIO(contents))
         
-        # Create uploads directory if it doesn't exist
+        
         uploads_dir = os.path.join(os.path.dirname(__file__), '..', '..', 'uploads')
         os.makedirs(uploads_dir, exist_ok=True)
         
-        # Generate unique filename with timestamp
+        
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         unique_filename = f"{timestamp}_{file.filename}"
         file_path = os.path.join(uploads_dir, unique_filename)
         
-        # Save file to disk
+        
         df.to_csv(file_path, index=False, encoding='utf-8')
         
-        # Save upload history with file path
         upload = UploadHistory(
             filename=file.filename,
             file_path=file_path,
@@ -84,12 +81,10 @@ async def start_validation(upload_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Upload not found")
     
     try:
-        # Load the CSV (in production, store the file)
-        # For now, assume the CSV is in the parent directory
+        
         csv_path = os.path.join(os.path.dirname(__file__), '..', '..', 'testing_data.csv')
         df = pd.read_csv(csv_path, on_bad_lines='skip')
         
-        # Group doctors by hospital
         hospitals = group_doctors_by_hospital(df)
         
         all_results = []
@@ -100,7 +95,6 @@ async def start_validation(upload_id: int, db: Session = Depends(get_db)):
                 results = validate_hospital_doctors(hospital_name, address, csv_doctors)
                 all_results.extend(results)
             except Exception as e:
-                # Add error records
                 for doctor in csv_doctors:
                     all_results.append({
                         **doctor,
@@ -370,19 +364,29 @@ async def get_provider_details(provider_id: int, db: Session = Depends(get_db)):
     
     # Parse reason for updates
     if provider.reason and "Updated:" in provider.reason:
-        # Example reason: "Updated: phone 7842331982 -> 7842331777"
-        # We need to set 'original' to the old value (7842331982) 
-        # and 'validated' is already the current DB value (7842331777)
         try:
-             parts = provider.reason.split("Updated: ")
-             if len(parts) > 1:
-                 update_info = parts[1]
-                 # specific parser for "phone X -> Y"
-                 if "phone" in update_info and "->" in update_info:
-                     change_str = update_info.replace("phone", "").strip()
-                     old_val, new_val = change_str.split("->")
-                     original["phone"] = old_val.strip()
-                     validated["phone"] = new_val.strip()
+             
+             update_part = provider.reason.split("Updated: ", 1)[1]
+             pattern = r"(\w+)\s*\[(.*?)\s*→\s*(.*?)\]"
+             matches = re.finditer(pattern, update_part)
+             
+             field_map = {
+                 "phone": "phone",
+                 "phone_number": "phone", 
+                 "specialization": "specialties",
+                 "qualification": "education",
+                 "license_number": "npi"
+             }
+        
+             for match in matches:
+                 field_name = match.group(1)
+                 old_val = match.group(2).strip()
+                 
+                 key = field_map.get(field_name, field_name)
+                 
+                 if key in original:
+                     original[key] = old_val
+                     
         except Exception as e:
             print(f"Error parsing update reason: {e}")
 

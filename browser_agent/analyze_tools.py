@@ -5,7 +5,7 @@ from langchain_ollama import ChatOllama
 from langchain_sambanova import ChatSambaNova
 from langchain_groq import ChatGroq
 from schemas import build_attributes_model
-from prompts import get_code_analysis_prompt, get_vision_analysis_prompt
+from new_prompts import get_code_analysis_prompt, get_vision_analysis_prompt
 from utils import extract_json_from_markdown
 from browser_manager import browser_manager
 from PIL import Image
