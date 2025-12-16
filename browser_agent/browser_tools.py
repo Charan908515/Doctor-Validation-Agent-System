@@ -1,0 +1,751 @@
+from playwright.sync_api import sync_playwright
+from playwright.sync_api import Page, Locator
+from langchain_core.tools import tool
+from browser_manager import browser_manager
+from analyze_tools import extract_and_analyze_selectors
+import json
+import time
+from typing import  Optional
+
+
+from langchain_core.tools import tool
+from browser_manager import browser_manager
+import asyncio
+import json
+
+from crawler import extract_doctor_profile_urls, scrape_doctor_details
+
+@tool
+def get_all_page_links(filter_keyword: str = "") -> str:
+    """
+    Extracts all visible links (URLs) from the current page.
+    Args:
+        filter_keyword: (Optional) If provided, only returns links where the URL 
+                        or the link text contains this keyword (case-insensitive).
+    """
+    page = browser_manager.get_page()
+    if not page: return "Error: No page open"
+    
+    try:
+        # Extract both URL and text to help the AI decide
+        links_data = page.evaluate("""
+            () => {
+                return Array.from(document.querySelectorAll('a[href]'))
+                    .filter(a => {
+                        const style = window.getComputedStyle(a);
+                        return style.display !== 'none' && style.visibility !== 'hidden' && a.href.startsWith('http');
+                    })
+                    .map(a => ({
+                        text: a.innerText.trim().replace(/\\s+/g, ' '),
+                        url: a.href
+                    }));
+            }
+        """)
+        
+        unique_links = {item['url']: item['text'] for item in links_data}
+        
+        results = []
+        for url, text in unique_links.items():
+            if filter_keyword:
+                if filter_keyword.lower() not in url.lower() and filter_keyword.lower() not in text.lower():
+                    continue
+            results.append(url) # Return clean URL list for the agent
+            
+        if not results:
+            return "No links found."
+            
+        
+        return json.dumps(results)
+
+    except Exception as e:
+        return f"Error extracting links: {e}"
+
+@tool
+def batch_scrape_doctors(urls_json: str, is_department_page: bool = False):
+    """
+    High-Performance Batch Scraper.
+    Takes a JSON list of URLs and scrapes them in parallel using Crawl4AI.
+    
+    Args:
+        urls_json: A JSON string list of URLs. Example: '["https://site.com/doc1", "https://site.com/doc2"]'
+        is_department_page: Set to True if these are Department pages (lists of doctors) where we need to find profiles first.
+                            Set to False if these are already Doctor Profile pages where we scrape details directly.
+    """
+    try:
+        urls = json.loads(urls_json)
+        if not isinstance(urls, list):
+            return "Error: Input must be a valid JSON list of URLs."
+            
+        print(f">>> Batch Scraping {len(urls)} URLs in parallel (Dept Mode: {is_department_page})...")
+        
+        if is_department_page:
+          
+            profile_links = asyncio.run(extract_doctor_profile_urls(urls))
+            return f"Found {len(profile_links)} doctor profile URLs. You can now run batch_scrape_doctors on these: {json.dumps(profile_links)}"
+        else:
+          
+            results = asyncio.run(scrape_doctor_details(urls))
+            return json.dumps(results, indent=2)
+
+    except Exception as e:
+        return f"Error in batch scraping: {e}"
+@tool
+def hover_id(element_id: int):
+    """
+    Hovers over an element by its Set-of-Marks ID. 
+    Crucial for dropdown menus that only appear when the mouse is over them.
+    Example: hover_id(12)
+    """
+    page = browser_manager.get_page()
+    if not page: return "Error: No page open"
+    
+    try:
+        
+        loc = page.locator(f'[data-ai-id="{element_id}"]').first
+        if loc.count() == 0:
+            return f"Error: Element ID {element_id} not found. Did you run scan_page_with_som()?"
+        
+        loc.scroll_into_view_if_needed()
+        
+        loc.hover(force=True)
+        time.sleep(2) 
+        
+        return f"Hovered over Element #{element_id}. Run scan_page_with_som() again to see new options."
+    except Exception as e:
+        return f"Error hovering #{element_id}: {e}"
+
+
+@tool
+def scan_page_with_som(query: Optional[str] = "") -> str:
+    """
+    PRIMARY NAVIGATION TOOL.
+    1. Scans the page.
+    2. Draws Red Box IDs on ALL interactive elements.
+    3. Returns a text list of the most relevant IDs based on your query.
+    
+    Args:
+        query: Optional. If provided (e.g., "login", "submit"), returns only matching elements. 
+               If None, returns all major interactive elements.
+    """
+    global SOM_STATE
+    page = browser_manager.get_page()
+    if not page: return "Error: No page open"
+
+    try:
+        
+        elements_data = page.evaluate("""
+            () => {
+                document.querySelectorAll('.ai-som-overlay').forEach(el => el.remove());
+                let idCounter = 1;
+                let data = [];
+                
+                // Broader selection to catch custom buttons
+                const elements = document.querySelectorAll('a, button, input, textarea, select, [role="button"], [onclick], div[class*="btn"], span[class*="btn"]');
+                
+                elements.forEach(el => {
+                    const rect = el.getBoundingClientRect();
+                    const style = window.getComputedStyle(el);
+                    
+                    // Filter invisible elements
+                    if (rect.width > 5 && rect.height > 5 && style.visibility !== 'hidden' && style.display !== 'none' && style.opacity !== '0') {
+                        
+                        let text = el.innerText || el.placeholder || el.value || el.getAttribute('aria-label') || "";
+                        text = text.replace(/\\s+/g, ' ').trim();
+                        
+                        // Assign ID
+                        el.setAttribute('data-ai-id', idCounter);
+                        
+                        // Draw Overlay
+                        let overlay = document.createElement('div');
+                        overlay.className = 'ai-som-overlay';
+                        overlay.style.position = 'absolute';
+                        overlay.style.left = (rect.left + window.scrollX) + 'px';
+                        overlay.style.top = (rect.top + window.scrollY) + 'px';
+                        overlay.style.width = rect.width + 'px';
+                        overlay.style.height = rect.height + 'px';
+                        overlay.style.border = '2px solid #FF0000';
+                        overlay.style.zIndex = '10000';
+                        overlay.style.pointerEvents = 'none';
+                        
+                        let label = document.createElement('span');
+                        label.className = 'ai-som-overlay';
+                        label.innerText = idCounter;
+                        label.style.position = 'absolute';
+                        label.style.top = '-15px';
+                        label.style.left = '0';
+                        label.style.backgroundColor = '#FF0000';
+                        label.style.color = 'white';
+                        label.style.fontSize = '12px';
+                        label.style.padding = '0 2px';
+                        
+                        overlay.appendChild(label);
+                        document.body.appendChild(overlay);
+                        
+                        data.push({
+                            id: idCounter,
+                            tag: el.tagName.toLowerCase(),
+                            text: text.substring(0, 50)
+                        });
+
+                        idCounter++;
+                    }
+                });
+                return data;
+            }
+        """)
+        
+        SOM_STATE = elements_data
+        response_lines = ["Successfully enabled Set-of-Marks."]
+        
+        if not elements_data:
+            return "Overlay enabled, but NO interactive elements found. Try scrolling."
+
+        if query:
+            query = query.lower()
+            matches = [e for e in elements_data if query in e['text'].lower()]
+            if matches:
+                response_lines.append(f"Found {len(matches)} elements matching '{query}':")
+                for m in matches:
+                    response_lines.append(f"[ID: {m['id']}] {m['tag'].upper()} -> '{m['text']}'")
+            else:
+                response_lines.append(f"No exact matches for '{query}'. Here are some visible elements:")
+                for m in elements_data[:15]:
+                    response_lines.append(f"[ID: {m['id']}] {m['tag'].upper()} -> '{m['text']}'")
+        else:
+            response_lines.append("Visible Interactive Elements:")
+            for m in elements_data[:30]: # Limit to avoid token overflow
+                response_lines.append(f"[ID: {m['id']}] {m['tag'].upper()} -> '{m['text']}'")
+
+        return "\n".join(response_lines)
+
+    except Exception as e:
+        return f"Error scanning page: {e}"
+
+@tool
+def get_interactive_elements() -> str:
+    """
+    Returns a list of all marked interactive elements on the screen.
+    Format: [ID] Type: "Text content"
+    Use this to decide which ID to click or fill.
+    """
+    page = browser_manager.get_page()
+    if not page: return "Error: No page open"
+
+    try:
+        elements_info = page.evaluate("""
+            () => {
+                const els = document.querySelectorAll('[data-ai-id]');
+                return Array.from(els).map(el => {
+                    const tag = el.tagName.toLowerCase();
+                    const type = el.getAttribute('type') || '';
+                    const id = el.getAttribute('data-ai-id');
+                    
+                    // Get useful text
+                    let text = el.innerText || el.placeholder || el.getAttribute('aria-label') || el.value || '';
+                    text = text.replace(/\\s+/g, ' ').trim().substring(0, 50); // Clean and truncate
+                    
+                    return `[${id}] <${tag} ${type}>: "${text}"`;
+                });
+            }
+        """)
+        #print("Interactive Elements:\n" + "\n".join(elements_info))
+        
+        return "Interactive Elements:\n" + "\n".join(elements_info)
+    except Exception as e:
+        return f"Error getting elements: {e}"
+
+@tool
+def get_page_text() -> str:
+    """
+    Returns the visible text of the page. 
+    Use this to READ content (like product details) that isn't a button/link.
+    """
+    #time.sleep(15)
+    page = browser_manager.get_page()
+    if not page: return "Error: No page open"
+    try:
+        return page.evaluate("document.body.innerText")[:10000] 
+    except Exception as e:
+        return f"Error reading text: {e}"
+
+@tool
+def click_id(element_id: int):
+    """
+    Clicks an element by its Set-of-Marks ID. 
+    Example: click_id(12)
+    """
+    #time.sleep(15)
+    page = browser_manager.get_page()
+    if not page: return "Error: No page open"
+    
+    try:
+        loc = page.locator(f'[data-ai-id="{element_id}"]').first
+        if loc.count() == 0:
+            return f"Error: Element ID {element_id} not found. Did you run enable_vision_overlay()?"
+        
+        loc.scroll_into_view_if_needed()
+        loc.click(force=True) 
+        return f"Clicked Element #{element_id}"
+    except Exception as e:
+        return f"Error clicking #{element_id}: {e}"
+
+@tool
+def fill_id(element_id: int, text: str):
+    """
+    Fills an input element by its Set-of-Marks ID.
+    Example: fill_id(45, "Python Developer")
+    """
+    #time.sleep(15)
+    page = browser_manager.get_page()
+    if not page: return "Error: No page open"
+    
+    try:
+        loc = page.locator(f'[data-ai-id="{element_id}"]').first
+        if loc.count() == 0:
+            return f"Error: Element ID {element_id} not found."
+            
+        loc.scroll_into_view_if_needed()
+        loc.fill(text)
+        return f"Filled Element #{element_id} with '{text}'"
+    except Exception as e:
+        return f"Error filling #{element_id}: {e}"
+@tool
+def scroll_one_screen():
+    """Scrolls down one screen."""
+    page = browser_manager.get_page()
+    if page:
+        page.mouse.wheel(0, 600)
+        return "Scrolled down."
+    return "No browser open."
+
+@tool
+def press_key(key: str):
+    """Presses a key (Enter, Escape, ArrowDown, Tab)."""
+    page = browser_manager.get_page()
+    if page:
+        page.keyboard.press(key)
+        return f"Pressed {key}"
+    return "No browser open."
+
+@tool
+def upload_file(element_id: int, file_path: str):
+    """Uploads file."""
+    page = browser_manager.get_page()
+    if not page: return "No browser open."
+    try:
+        loc = page.locator(f'[data-ai-id="{element_id}"]').first
+        loc.set_input_files(file_path)
+        return f"Uploaded to #{element_id}"
+    except Exception as e:
+        return f"Upload error: {e}"
+
+
+
+@tool
+def get_accessibility_tree() -> str:
+    """
+    Returns a simplified text representation of the page's interactive elements.
+    Use this to 'see' the page structure and find IDs/Roles for elements.
+    """
+    page = browser_manager.get_page()
+    if not page: return "Error: No page open"
+    
+    try:
+        snapshot = page.accessibility.snapshot()
+        
+        def parse_node(node, depth=0):
+            text = ""
+            indent = "  " * depth
+            
+            # We only care about interactive or text elements
+            role = node.get("role", "generic")
+            name = node.get("name", "").strip()
+            value = node.get("value", "")
+            description = node.get("description", "")
+            
+            # Create a simplified signature
+            if name or value or role in ["button", "link", "textbox", "combobox", "checkbox"]:
+                info = f"{role}"
+                if name: info += f": '{name}'"
+                if value: info += f" [Value: {value}]"
+                if description: info += f" ({description})"
+                
+                text += f"{indent}- {info}\n"
+            
+            for child in node.get("children", []):
+                text += parse_node(child, depth + 1)
+            
+            return text
+
+        tree_text = parse_node(snapshot)
+        return f"Current Page Interactive Elements:\n{tree_text}"
+    except Exception as e:
+        return f"Error getting accessibility tree: {e}"
+
+@tool
+def click_element(selector: str):
+    """Clicks an element. Handles 'Strict Mode' and Overlays automatically."""
+    page = browser_manager.get_page()
+    if not page: return "Error: No browser page is open"
+    
+    try:
+        count = page.locator(selector).count()
+        if count > 1:
+            print(f"Warning: {count} elements found for '{selector}'. Clicking the first visible one.")
+            locator = page.locator(selector).filter(has=page.locator("visible=true")).first
+            if not locator.is_visible():
+                locator = page.locator(selector).first
+        else:
+            locator = page.locator(selector).first
+
+    
+        locator.scroll_into_view_if_needed()
+        page.wait_for_timeout(500)
+
+    
+        try:
+            locator.click(timeout=2000)
+        except Exception as e:
+            print(f"Standard click failed ({e}). forcing click...")
+            locator.click(force=True)
+            
+        page.wait_for_load_state("domcontentloaded")
+        return f"Clicked: {selector}"
+    except Exception as e:
+        return f"Error clicking: {str(e)}"
+
+@tool
+def fill_element(selector: str, text: str):
+    """Fills input. Uses JS Injection if standard fill is blocked (Fixes Wellfound)."""
+    page = browser_manager.get_page()
+    if not page: return "Error: No browser page is open"
+    
+    try:
+        locator = page.locator(selector).first
+        
+    
+        if not locator.is_visible():
+            locator.scroll_into_view_if_needed()
+            page.wait_for_timeout(500)
+
+        
+        try:
+            locator.click(force=True, timeout=1000)
+            locator.clear()
+            page.keyboard.type(text, delay=50)
+            return f"Filled {selector} with: {text}"
+        except Exception:
+            print(f"Standard fill failed. Using JS Injection for {selector}...")
+
+        
+        page.evaluate(f"""
+            const el = document.querySelector('{selector}');
+            if (el) {{
+                el.value = '{text}';
+                el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                el.dispatchEvent(new Event('blur', {{ bubbles: true }}));
+            }}
+        """)
+    
+        page.keyboard.press("Enter")
+        
+        return f"Filled {selector} using JS Injection."
+    except Exception as e:
+        return f"Error filling: {str(e)}"
+
+@tool
+def select_dropdown_option(option_text: str, dropdown_selector: str = None, option_selector: str = None):
+    """
+    Selects an option from a visible dropdown menu.
+    
+    Args:
+        option_text: The visible text of the option to click.
+        dropdown_selector: (Optional) The container of the dropdown.
+        option_selector: (Optional) The specific selector for the option element.
+    """
+    page = browser_manager.get_page()
+    if not page:
+        return "Error: No browser page is open"
+    
+    try:
+        
+        page.wait_for_timeout(500)
+        
+        target_option = None
+
+        
+        if dropdown_selector and option_selector:
+            
+            target_option = page.locator(f"{dropdown_selector} {option_selector}").filter(has_text=option_text).first
+            if target_option.count() == 0:
+    
+                target_option = page.locator(f"{dropdown_selector} span, {dropdown_selector} div").filter(has_text=option_text).first
+        
+        
+        elif option_text:
+            
+            target_option = page.get_by_text(option_text, exact=True).first
+            if not target_option.is_visible():
+                
+                 target_option = page.get_by_text(option_text, exact=False).first
+
+        if target_option and target_option.count() > 0 and target_option.is_visible():
+            target_option.scroll_into_view_if_needed()
+            page.wait_for_timeout(200)
+            target_option.click(force=True) 
+            page.wait_for_timeout(800)
+            return f"Selected option: '{option_text}'"
+        else:
+            return f"Error: Option '{option_text}' not visible. Ensure the dropdown is open first."
+
+    except Exception as e:
+        return f"Error selecting option: {str(e)}"
+
+@tool
+def open_dropdown_and_select(dropdown_selector: str, option_text: str, click_to_open: bool = True):
+    """
+    Opens a dropdown menu and selects a specific option.
+    Useful for custom dropdown implementations (not native <select> elements).
+    
+    Args:
+        dropdown_selector: CSS selector for the dropdown trigger/container
+        option_text: The visible text of the option to select
+        click_to_open: Whether to click the dropdown to open it (default True)
+    
+    Returns:
+        Status message indicating success or error
+    """
+    page = browser_manager.get_page()
+    if not page:
+        return "Error: No browser page is open"
+    
+    try:
+        
+        dropdown_trigger = page.locator(dropdown_selector).first
+        
+        if not dropdown_trigger.is_visible():
+            dropdown_trigger.scroll_into_view_if_needed()
+            page.wait_for_timeout(300)
+        
+        if click_to_open:
+            dropdown_trigger.click(force=True)
+            page.wait_for_timeout(1000) 
+        option_element = None
+        option_element = page.get_by_text(option_text, exact=True).first
+        if option_element.count() == 0:
+            option_element = page.get_by_text(option_text, exact=False).first
+        if option_element.count() == 0:
+            option_element = page.locator(f"span:has-text('{option_text}'), div:has-text('{option_text}'), option:has-text('{option_text}')").first
+        if option_element.count() > 0 and option_element.is_visible():
+            option_element.scroll_into_view_if_needed()
+            page.wait_for_timeout(200)
+            option_element.click(force=True)
+            page.wait_for_timeout(800)
+            return f"Successfully opened dropdown and selected: '{option_text}'"
+        else:
+            return f"Error: Could not find option '{option_text}' in dropdown menu. Dropdown may not have opened correctly."
+    
+    except Exception as e:
+        return f"Error in dropdown selection: {str(e)}"
+
+@tool
+def select_native_select_option(select_selector: str, option_value: str):
+    """
+    Selects an option from a native HTML <select> element.
+    Use this for standard HTML select dropdowns (not custom implementations).
+    
+    Args:
+        select_selector: CSS selector for the <select> element
+        option_value: The value of the <option> to select (can be the visible text)
+    
+    Returns:
+        Status message
+    """
+    page = browser_manager.get_page()
+    if not page:
+        return "Error: No browser page is open"
+    
+    try:
+        select_element = page.locator(select_selector).first
+        
+        if not select_element.is_visible():
+            select_element.scroll_into_view_if_needed()
+            page.wait_for_timeout(300)
+        select_element.select_option(option_value)
+        page.wait_for_timeout(800)
+        
+        return f"Selected '{option_value}' from select element"
+    except Exception as e:
+        return f"Error selecting from select element: {str(e)}"
+@tool
+def upload_file(selector: str, file_path: str):
+    """Uploads a file using a CSS selector.
+    
+    Args:
+        selector: CSS selector for the file input
+        file_path: Path to the file to upload
+    """
+    page = browser_manager.get_page()
+    
+    if not page:
+        return "Error: No browser page is open"
+    try:
+        element = page.locator(selector)
+        element.set_input_files(file_path)
+        return f"Uploaded file {file_path} to {selector}"
+    except Exception as e:
+        return f"Error uploading file: {str(e)}"
+
+@tool
+def scroll_to_bottom():
+    """Scrolls to the bottom of the page."""
+    page = browser_manager.get_page()
+    if not page:
+        return "Error: No browser page is open"
+    try:
+        page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+        return "Scrolled to bottom"
+    except Exception as e:
+        return f"Error scrolling: {str(e)}"
+
+
+
+@tool
+def extract_text_from_selector(selector: str) -> str:
+    """
+    Extracts visible text from a single specific element.
+    Useful for: Getting the job title or company name from a specific card.
+    
+    Args:
+        selector: CSS selector for the element
+    """
+    page = browser_manager.get_page()
+    page.wait_for_load_state("load")
+    if not page:
+        return "Error: No browser page is open"
+    try:
+        if page.locator(selector).count() > 0:
+            return page.locator(selector).first.inner_text().strip()
+        return "Not Found"
+    except Exception as e:
+        print(f"Error extracting text: {e}")
+        return ""
+
+@tool
+def extract_attribute_from_selector(selector: str, attribute: str = "href") -> str:
+    """
+    Extracts an attribute (like 'href' for URLs) from an element.
+    
+    Args:
+        selector: CSS selector for the element
+        attribute: Attribute name to extract (default: href)
+    """
+    page = browser_manager.get_page()
+    page.wait_for_load_state("load",timeout=60000)
+    if not page:
+        return "Error: No browser page is open"
+    try:
+        element = page.locator(selector).first
+        return element.get_attribute(attribute) or ""
+    except Exception as e:
+        print(f"Error extracting attribute: {e}")
+        return ""
+
+
+import time
+import random
+
+
+@tool
+def get_visible_input_fields() -> dict:
+    """
+    Gets all visible input fields on the current page with their placeholders and estimated purposes.
+    Useful when fill_element fails and you need to find the right visible input to use.
+    
+    Returns a dictionary with placeholder text as keys and field info as values.
+    """
+    page = browser_manager.get_page()
+    if not page:
+        return {"error": "No browser page is open"}
+    
+    try:
+        visible_fields = page.evaluate('''
+            () => {
+                const fields = {};
+                const inputs = document.querySelectorAll('input[type="text"], input:not([type]), textarea, select');
+                
+                inputs.forEach((input, idx) => {
+                    const style = window.getComputedStyle(input);
+                    const isVisible = style.display !== 'none' && 
+                                    style.visibility !== 'hidden' && 
+                                    input.offsetParent !== null &&
+                                    input.offsetWidth > 0 &&
+                                    input.offsetHeight > 0;
+                    
+                    if (isVisible) {
+                        const placeholder = input.placeholder || input.name || input.id || `field_${idx}`;
+                        const tagName = input.tagName;
+                        const value = input.value;
+                        const classes = input.className;
+                        
+                        fields[placeholder] = {
+                            tag: tagName,
+                            placeholder: input.placeholder,
+                            name: input.name,
+                            id: input.id,
+                            type: input.type,
+                            value: value,
+                            class: classes,
+                            selector_options: [
+                                input.id ? `#${input.id}` : null,
+                                input.placeholder ? `input[placeholder="${input.placeholder}"]` : null,
+                                input.placeholder ? `input[placeholder*="${input.placeholder.split(' ')[0]}"]` : null,
+                                input.name ? `input[name="${input.name}"]` : null,
+                            ].filter(Boolean)
+                        };
+                    }
+                });
+                
+                return fields;
+            }
+        ''')
+        
+        return visible_fields if visible_fields else {"note": "No visible input fields found"}
+    except Exception as e:
+        return {"error": f"Could not get visible fields: {str(e)}"}
+
+@tool
+def hover_element(selector: str, wait_time: int = 1500):
+    """
+    Hovers over an element to trigger tooltips, help text, or field validation messages.
+    Useful for revealing additional information when hovering over input fields, help icons, or info buttons.
+    
+    Args:
+        selector: CSS selector for the element to hover over
+        wait_time: Time in milliseconds to wait after hovering for tooltip/help text to appear (default: 1500ms)
+    
+    Returns:
+        Status message indicating success or error
+    """
+    page = browser_manager.get_page()
+    if not page:
+        return "Error: No browser page is open"
+    
+    try:
+        element = page.locator(selector).first
+        if element.count() == 0:
+            return f"Error: Element not found with selector: {selector}"
+        if not element.is_visible():
+            element.scroll_into_view_if_needed()
+            page.wait_for_timeout(300)
+        if not element.is_visible():
+            return f"Error: Element with selector '{selector}' exists but is not visible"
+        
+        element.hover(force=True)
+        page.wait_for_timeout(wait_time)
+        
+        return f"Successfully hovered over element: {selector}. Tooltip/help text should now be visible."
+    
+    except Exception as e:
+        return f"Error hovering over element: {str(e)}"

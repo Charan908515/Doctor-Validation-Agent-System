@@ -1,0 +1,10 @@
+profiles
+rag_data
+*.png
+*.csv
+*.env
+__pycache__
+outputs
+config/.env
+*.db
+uploads
